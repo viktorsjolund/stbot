@@ -1,12 +1,17 @@
 use base64::{prelude::BASE64_STANDARD, Engine};
 use dotenv;
+use futures_lite::stream::StreamExt;
+use lapin::{options::*, types::FieldTable, Connection, ConnectionProperties};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::str;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use websocket::{ws::dataframe::DataFrame, ClientBuilder, Message};
 
 #[tokio::main]
 async fn main() {
+    let addr = dotenv::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://localhost:5672".into());
     let mut client = ClientBuilder::new("ws://irc-ws.chat.twitch.tv:80")
         .unwrap()
         .connect_insecure()
@@ -30,29 +35,64 @@ async fn main() {
     let _ = client.send_message(&nick);
     let _ = client.send_message(&join);
 
-    let (mut reciever, mut sender) = client.split().unwrap();
+    let conn = Connection::connect(&addr, ConnectionProperties::default())
+        .await
+        .unwrap();
 
-    for message in reciever.incoming_messages() {
-        match message {
-            Ok(owned_message) => {
-                if owned_message.is_data() {
-                    let payload = &Message::from(owned_message).take_payload();
-                    let message_as_str = str::from_utf8(&payload).unwrap();
-                    let messages: Vec<&str> = message_as_str.trim_end().split("\r\n").collect();
-                    for m in messages.iter() {
-                        let parsed_message = parse_message(m).unwrap();
-                        println!("{:?}", parsed_message);
-                        let response = generate_response(parsed_message).await;
-                        if let Ok(r) = response {
-                            let reply = Message::text(r);
-                            let _ = sender.send_message(&reply);
+    let channel_a = conn.create_channel().await.unwrap();
+    let (reciever, sender) = client.split().unwrap();
+    let rec = Arc::new(Mutex::new(reciever));
+    let sen = Arc::new(Mutex::new(sender));
+
+    for _ in 0..1 {
+        let reciever = Arc::clone(&rec);
+        let sender = Arc::clone(&sen);
+        tokio::spawn(async move {
+            for message in reciever.lock().await.incoming_messages() {
+                match message {
+                    Ok(owned_message) => {
+                        if owned_message.is_data() {
+                            let payload = &Message::from(owned_message).take_payload();
+                            let message_as_str = str::from_utf8(&payload).unwrap();
+                            let messages: Vec<&str> =
+                                message_as_str.trim_end().split("\r\n").collect();
+                            for m in messages.iter() {
+                                let parsed_message = parse_message(m).unwrap();
+                                println!("{:?}", parsed_message);
+                                let response = generate_response(parsed_message).await;
+                                if let Ok(r) = response {
+                                    let reply = Message::text(r);
+                                    let _ = sender.lock().await.send_message(&reply);
+                                }
+                            }
                         }
+                    }
+                    Err(e) => {
+                        println!("An error occured: {:?}", e);
                     }
                 }
             }
-            Err(e) => {
-                println!("An error occured: {:?}", e);
-            }
+        });
+    }
+
+    let mut consumer = channel_a
+        .basic_consume(
+            "send",
+            "bot",
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..1 {
+        let sender = Arc::clone(&sen);
+        while let Some(delivery) = consumer.next().await {
+            let delivery = delivery.expect("error in consumer");
+            let data = str::from_utf8(&delivery.data).unwrap();
+            let msg = Message::text(data);
+            let _ = sender.lock().await.send_message(&msg);
+            delivery.ack(BasicAckOptions::default()).await.unwrap();
         }
     }
 }

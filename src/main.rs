@@ -9,6 +9,43 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use websocket::{ws::dataframe::DataFrame, ClientBuilder, Message};
 
+#[derive(Default, Debug)]
+struct MessageResponse {
+    tags: Option<Tags>,
+    source: Source,
+    command: Option<Command>,
+    parameters: Option<String>,
+}
+
+#[derive(Default, Debug)]
+struct Tags {
+    badges: Option<HashMap<String, String>>,
+    emote_sets: Option<HashMap<String, String>>,
+    emotes: Option<HashMap<String, Vec<Emote>>>,
+    other: Option<HashMap<String, String>>,
+}
+
+#[derive(Default, Debug)]
+#[allow(dead_code)]
+struct Emote {
+    start_position: Option<String>,
+    end_position: Option<String>,
+}
+#[derive(Default, Debug)]
+struct Source {
+    nick: Option<String>,
+    host: Option<String>,
+}
+
+#[derive(Default, Debug, Clone)]
+struct Command {
+    command: Option<String>,
+    channel: Option<String>,
+    is_cap_request_enabled: Option<bool>,
+    bot_command: Option<String>,
+    bot_command_params: Option<String>,
+}
+
 #[tokio::main]
 async fn main() {
     let addr = dotenv::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://localhost:5672".into());
@@ -97,52 +134,33 @@ async fn main() {
     }
 }
 
-async fn generate_response(
-    parsed_message: HashMap<String, HashMap<String, HashMap<String, Vec<HashMap<String, String>>>>>,
-) -> Result<String, ()> {
-    let default_str = "".to_string();
+async fn generate_response(parsed_message: MessageResponse) -> Result<String, ()> {
     let command = parsed_message
-        .get("command")
-        .and_then(|m| m.get("data"))
-        .and_then(|m| m.get("data"))
-        .and_then(|v| v.get(0))
-        .and_then(|m| m.get("command"))
-        .unwrap_or(&default_str)
-        .as_str();
-
+        .command
+        .clone()
+        .and_then(|c| c.command)
+        .unwrap_or_default();
     let channel = parsed_message
-        .get("command")
-        .and_then(|m| m.get("data"))
-        .and_then(|m| m.get("data"))
-        .and_then(|v| v.get(0))
-        .and_then(|m| m.get("channel"))
-        .unwrap_or(&default_str)
-        .as_str();
-
-    let parameter_message = parsed_message
-        .get("parameters")
-        .and_then(|m| m.get("data"))
-        .and_then(|m| m.get("data"))
-        .and_then(|v| v.get(0))
-        .and_then(|m| m.get("message"))
-        .unwrap_or(&default_str)
-        .as_str();
-
+        .command
+        .clone()
+        .and_then(|c| c.channel)
+        .unwrap_or_default();
+    let message = parsed_message.parameters.unwrap_or_default();
     let message_id = parsed_message
-        .get("tags")
-        .and_then(|m| m.get("id"))
-        .and_then(|m| m.get("data"))
-        .and_then(|v| v.get(0))
-        .and_then(|m| m.get("tagValue"))
-        .unwrap_or(&default_str)
-        .as_str();
+        .tags
+        .and_then(|t| t.other)
+        .and_then(|o| match o.get("id") {
+            Some(s) => Some(s.to_owned()),
+            None => None,
+        })
+        .unwrap_or_default();
 
-    match command {
+    match command.as_str() {
         "PING" => {
-            return Ok(format!("PONG {}", parameter_message));
+            return Ok(format!("PONG {}", message));
         }
         "PRIVMSG" => {
-            let reply = reply_message(parameter_message).await?;
+            let reply = reply_message(message.as_str()).await?;
             return Ok(format!(
                 "@reply-parent-msg-id={} PRIVMSG {} :{}",
                 message_id, channel, reply
@@ -167,7 +185,7 @@ async fn reply_message(user_msg: &str) -> Result<String, ()> {
                     }
                 }
                 Err(e) => {
-                    println!("--error-- {:?}", e);
+                    println!("{:?}", e);
                     return Err(());
                 }
             };
@@ -262,11 +280,11 @@ async fn get_spotify_access_token() -> Result<String, Box<dyn std::error::Error>
     return Ok(res.access_token);
 }
 
-fn parse_message(
-    irc_message: &str,
-) -> Option<HashMap<String, HashMap<String, HashMap<String, Vec<HashMap<String, String>>>>>> {
+fn parse_message(irc_message: &str) -> Option<MessageResponse> {
     println!("raw msg: {:?}", irc_message);
-    let mut parsed_message = HashMap::new();
+    let mut pm = MessageResponse {
+        ..Default::default()
+    };
     let mut idx = 0;
     let mut raw_tags_component: &str = "";
     let mut raw_source_component: &str = "";
@@ -298,43 +316,33 @@ fn parse_message(
         raw_parameters_component = &irc_message[idx..];
     }
 
-    let mut parsed_command = parse_command(raw_command_component).unwrap_or_else(|| HashMap::new());
-    let command_map = create_nesting(&mut parsed_command);
-    parsed_message.insert("command".to_string(), command_map);
-    if let Some(m) = parsed_message.get("command") {
-        if m.len() > 0 {
-            if raw_tags_component != "" {
-                let parsed_tags = parse_tags(raw_tags_component);
-                parsed_message.insert("tags".to_string(), parsed_tags);
-            }
+    let parsed_command = parse_command(raw_command_component);
+    pm.command = parsed_command;
+    if let Some(c) = pm.command.clone() {
+        if raw_tags_component != "" {
+            let parsed_tags = parse_tags(raw_tags_component);
+            pm.tags = Some(parsed_tags);
+        }
 
-            let mut parsed_source =
-                parse_source(raw_source_component).unwrap_or_else(|| HashMap::new());
-            let source_map = create_nesting(&mut parsed_source);
-            parsed_message.insert("source".to_string(), source_map);
+        let parsed_source = parse_source(raw_source_component);
+        pm.source = parsed_source;
 
-            let mut param_m = HashMap::new();
-            param_m.insert("message".to_string(), raw_parameters_component.to_string());
-            let param_map = create_nesting(&mut param_m);
-            parsed_message.insert("parameters".to_string(), param_map);
+        pm.parameters = Some(raw_parameters_component.to_string());
 
-            if raw_parameters_component == "!" {
-                let mut parsed_params =
-                    parse_parameters(raw_parameters_component, &mut parsed_command);
-                let parameter_map = create_nesting(&mut parsed_params);
-                parsed_message.insert("command".to_string(), parameter_map);
-            }
-        } else {
-            return None;
+        if raw_parameters_component == "!" {
+            let parsed_params = parse_parameters(raw_parameters_component, c);
+            pm.command = Some(parsed_params);
         }
     }
 
-    return Some(parsed_message);
+    return Some(pm);
 }
 
-fn parse_tags(tags: &str) -> HashMap<String, HashMap<String, Vec<HashMap<String, String>>>> {
+fn parse_tags(tags: &str) -> Tags {
     let tags_to_ignore = vec!["client-nonce", "flags"];
-    let mut dict_parsed_tags = HashMap::new();
+    let mut ta = Tags {
+        ..Default::default()
+    };
     let parsed_tags: Vec<&str> = tags.split(";").collect();
     for t in parsed_tags.iter() {
         let parsed_tag: Vec<&str> = t.split("=").collect();
@@ -348,119 +356,141 @@ fn parse_tags(tags: &str) -> HashMap<String, HashMap<String, Vec<HashMap<String,
         match parsed_tag[0] {
             "badges" | "badge-info" => {
                 if tag_value != "" {
-                    let mut dict = HashMap::new();
+                    let mut badges_map = HashMap::new();
+                    if let Some(prev) = ta.badges {
+                        badges_map.extend(prev);
+                    }
                     let badges: Vec<&str> = tag_value.split(",").collect();
                     for b in badges.iter() {
                         let badge_parts: Vec<&str> = b.split("/").collect();
-                        dict.insert(badge_parts[0].to_string(), badge_parts[1].to_string());
+                        badges_map.insert(badge_parts[0].to_string(), badge_parts[1].to_string());
                     }
-                    let mut v = Vec::new();
-                    v.push(dict);
-                    let mut m = HashMap::new();
-                    m.insert("dict".to_string(), v);
-                    dict_parsed_tags.insert(parsed_tag[0].to_string(), m);
-                } else {
-                    let mut v = Vec::new();
-                    v.push(HashMap::new());
-                    let mut m = HashMap::new();
-                    m.insert("dict".to_string(), v);
-                    dict_parsed_tags.insert(parsed_tag[0].to_string(), m);
+                    ta.badges = Some(badges_map);
                 }
             }
             "emotes" => {
                 if tag_value != "" {
                     let mut dict_emotes = HashMap::new();
+                    if let Some(prev) = ta.emotes {
+                        dict_emotes.extend(prev);
+                    }
                     let emotes: Vec<&str> = tag_value.split("/").collect();
                     for e in emotes.iter() {
                         let emote_parts: Vec<&str> = e.split(":").collect();
-                        let mut text_positions = Vec::new();
+                        let mut text_positions: Vec<Emote> = Vec::new();
                         let positions: Vec<&str> = emote_parts[1].split(",").collect();
                         for p in positions.iter() {
                             let position_parts: Vec<&str> = p.split("-").collect();
-                            let mut pos_map = HashMap::new();
-                            pos_map.insert(
-                                String::from("startPosition"),
-                                position_parts[0].to_string(),
-                            );
-                            pos_map
-                                .insert(String::from("endPosition"), position_parts[1].to_string());
-                            text_positions.push(pos_map);
+                            text_positions.push(Emote {
+                                start_position: match position_parts.get(0) {
+                                    Some(s) => Some(s.to_string()),
+                                    None => None,
+                                },
+                                end_position: match position_parts.get(1) {
+                                    Some(s) => Some(s.to_string()),
+                                    None => None,
+                                },
+                            });
                         }
                         dict_emotes.insert(emote_parts[0].to_string(), text_positions);
                     }
-                    dict_parsed_tags.insert(parsed_tags[0].to_string(), dict_emotes);
-                } else {
-                    let mut v = Vec::new();
-                    v.push(HashMap::new());
-                    let mut m = HashMap::new();
-                    m.insert("data".to_string(), v);
-                    dict_parsed_tags.insert(parsed_tag[0].to_string(), m);
+                    ta.emotes = Some(dict_emotes);
                 }
             }
             "emote-sets" => {
-                let mut m1 = HashMap::new();
+                let mut emote_sets = HashMap::new();
                 let emote_set_ids: Vec<&str> = tag_value.split(",").collect();
                 for (i, es) in emote_set_ids.iter().enumerate() {
-                    m1.insert(i.to_string(), es.to_owned().to_string());
+                    emote_sets.insert(i.to_string(), es.to_owned().to_string());
                 }
-                let mut v = Vec::new();
-                v.push(m1);
-                let mut m = HashMap::new();
-                m.insert("emoteSets".to_string(), v);
-                dict_parsed_tags.insert(parsed_tag[0].to_string(), m);
+                ta.emote_sets = Some(emote_sets);
             }
             _ => {
                 if !tags_to_ignore.contains(&parsed_tag[0]) {
-                    let mut m = HashMap::new();
-                    let mut v = Vec::new();
-                    let mut m1 = HashMap::new();
-                    m1.insert("tagValue".to_string(), tag_value.to_string());
-                    v.push(m1);
-                    m.insert("data".to_string(), v);
-                    dict_parsed_tags.insert(parsed_tag[0].to_string(), m);
+                    let mut other = HashMap::new();
+                    other.insert(parsed_tag[0].to_string(), tag_value.to_string());
+                    if let Some(prev) = ta.other {
+                        other.extend(prev);
+                    }
+                    ta.other = Some(other);
                 }
             }
         }
     }
 
-    return dict_parsed_tags;
+    return ta;
 }
 
-fn parse_command(raw_command_component: &str) -> Option<HashMap<String, String>> {
-    let mut parsed_command = HashMap::new();
+fn parse_command(raw_command_component: &str) -> Option<Command> {
+    let mut pc = Command {
+        ..Default::default()
+    };
     let command_parts: Vec<&str> = raw_command_component.split(" ").collect();
 
     match command_parts[0] {
         "JOIN" | "PART" | "NOTICE" | "CLEARCHAT" | "HOSTTARGET" | "PRIVMSG" => {
-            parsed_command.insert("command".to_string(), command_parts[0].to_string());
-            parsed_command.insert("channel".to_string(), command_parts[1].to_string());
+            pc.command = match command_parts.get(0) {
+                Some(s) => Some(s.to_string()),
+                None => None,
+            };
+            pc.channel = match command_parts.get(1) {
+                Some(s) => Some(s.to_string()),
+                None => None,
+            };
         }
         "PING" => {
-            parsed_command.insert("command".to_string(), command_parts[0].to_string());
+            pc.command = match command_parts.get(0) {
+                Some(s) => Some(s.to_string()),
+                None => None,
+            };
         }
         "CAP" => {
-            parsed_command.insert("command".to_string(), command_parts[0].to_string());
-            let is_enabled = command_parts[2] == "ACK";
-            parsed_command.insert("isCapRequestEnabled".to_string(), is_enabled.to_string());
+            pc.command = match command_parts.get(0) {
+                Some(s) => Some(s.to_string()),
+                None => None,
+            };
+            let is_enabled = match command_parts.get(2) {
+                Some(s) => Some(s == &"ACK"),
+                None => None,
+            };
+            pc.is_cap_request_enabled = is_enabled;
         }
         "GLOBALUSERSTATE" => {
-            parsed_command.insert("command".to_string(), command_parts[0].to_string());
+            pc.command = match command_parts.get(0) {
+                Some(s) => Some(s.to_string()),
+                None => None,
+            };
         }
         "USERSTATE" | "ROOMSTATE" => {
-            parsed_command.insert("command".to_string(), command_parts[0].to_string());
-            parsed_command.insert("channel".to_string(), command_parts[1].to_string());
+            pc.command = match command_parts.get(0) {
+                Some(s) => Some(s.to_string()),
+                None => None,
+            };
+            pc.channel = match command_parts.get(1) {
+                Some(s) => Some(s.to_string()),
+                None => None,
+            };
         }
         "RECONNECT" => {
             println!("The Twitch IRC server is about to terminate the connection for maintenance.");
-            parsed_command.insert("command".to_string(), command_parts[0].to_string());
+            pc.command = match command_parts.get(0) {
+                Some(s) => Some(s.to_string()),
+                None => None,
+            };
         }
         "421" => {
             println!("Unsupported IRC command: {:?}", command_parts[2]);
             return None;
         }
         "001" => {
-            parsed_command.insert("command".to_string(), command_parts[0].to_string());
-            parsed_command.insert("channel".to_string(), command_parts[1].to_string());
+            pc.command = match command_parts.get(0) {
+                Some(s) => Some(s.to_string()),
+                None => None,
+            };
+            pc.channel = match command_parts.get(1) {
+                Some(s) => Some(s.to_string()),
+                None => None,
+            };
         }
         "002" | "003" | "004" | "353" | "366" | "372" | "375" | "376" => {
             println!("numeric message: {:?}", command_parts[0]);
@@ -472,56 +502,49 @@ fn parse_command(raw_command_component: &str) -> Option<HashMap<String, String>>
         }
     }
 
-    return Some(parsed_command);
+    return Some(pc);
 }
 
-fn parse_source(raw_source_component: &str) -> Option<HashMap<String, String>> {
+fn parse_source(raw_source_component: &str) -> Source {
+    let mut s = Source {
+        ..Default::default()
+    };
     if raw_source_component == "" {
-        return None;
+        return s;
     } else {
         let source_parts: Vec<&str> = raw_source_component.split("!").collect();
-        let mut m = HashMap::new();
         if source_parts.len() == 2 {
-            m.insert("host".to_string(), source_parts[1].to_string());
-            m.insert("nick".to_string(), source_parts[0].to_string());
+            s.nick = match source_parts.get(0) {
+                Some(s) => Some(s.to_string()),
+                None => None,
+            };
+            s.host = match source_parts.get(1) {
+                Some(s) => Some(s.to_string()),
+                None => None,
+            };
         } else {
-            m.insert("nick".to_string(), "".to_string());
-            m.insert("host".to_string(), source_parts[0].to_string());
+            s.nick = None;
+            s.host = match source_parts.get(0) {
+                Some(s) => Some(s.to_string()),
+                None => None,
+            };
         }
 
-        return Some(m);
+        return s;
     }
 }
 
-fn parse_parameters(
-    raw_parameters_component: &str,
-    command: &mut HashMap<String, String>,
-) -> HashMap<String, String> {
+fn parse_parameters(raw_parameters_component: &str, command: Command) -> Command {
+    let mut command = command.clone();
     let idx = 0;
     let command_parts = raw_parameters_component[idx + 1..].trim();
     let params_idx = command_parts.chars().position(|c| c == ' ');
     if let Some(p) = params_idx {
-        command.insert("botCommand".to_string(), command_parts[0..p].to_string());
-        command.insert(
-            "botCommandParams".to_string(),
-            command_parts[p..].trim().to_string(),
-        );
+        command.bot_command = Some(command_parts[0..p].to_string());
+        command.bot_command_params = Some(command_parts[p..].trim().to_string());
     } else {
-        command.insert("botCommand".to_string(), command_parts.to_string());
+        command.bot_command = Some(command_parts.to_string());
     }
 
-    return command.to_owned();
-}
-
-fn create_nesting(
-    map: &mut HashMap<String, String>,
-) -> HashMap<String, HashMap<String, Vec<HashMap<String, String>>>> {
-    let mut v = Vec::new();
-    v.push(map.to_owned());
-    let mut m1 = HashMap::new();
-    let mut m2 = HashMap::new();
-    m2.insert("data".to_string(), v);
-    m1.insert("data".to_string(), m2.to_owned());
-
-    return m1;
+    return command;
 }

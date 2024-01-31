@@ -1,5 +1,3 @@
-use base64::{prelude::BASE64_STANDARD, Engine};
-use dotenv;
 use futures_lite::stream::StreamExt;
 use lapin::{options::*, types::FieldTable, Connection, ConnectionProperties};
 use serde::Deserialize;
@@ -61,11 +59,11 @@ async fn main() {
     ));
     let nick = Message::text(format!(
         "NICK {}",
-        dotenv::var("TWITCH_DISPLAY_NAME").unwrap()
+        dotenv::var("TWITCH_BOT_NICK").unwrap()
     ));
     let join = Message::text(format!(
         "JOIN #{}",
-        dotenv::var("TWITCH_DISPLAY_NAME").unwrap()
+        dotenv::var("TWITCH_CHANNEL_NAME").unwrap()
     ));
     let _ = client.send_message(&cap_req);
     let _ = client.send_message(&pass);
@@ -160,7 +158,7 @@ async fn generate_response(parsed_message: MessageResponse) -> Result<String, ()
             return Ok(format!("PONG {}", message));
         }
         "PRIVMSG" => {
-            let reply = reply_message(message.as_str()).await?;
+            let reply = reply_message(message.as_str(), &channel[1..]).await?;
             return Ok(format!(
                 "@reply-parent-msg-id={} PRIVMSG {} :{}",
                 message_id, channel, reply
@@ -170,12 +168,12 @@ async fn generate_response(parsed_message: MessageResponse) -> Result<String, ()
     }
 }
 
-async fn reply_message(user_msg: &str) -> Result<String, ()> {
+async fn reply_message(user_msg: &str, channel_name: &str) -> Result<String, ()> {
     let tokens: Vec<&str> = user_msg.split(" ").collect();
 
     match tokens.get(0) {
         Some(&"?song") => {
-            let song = get_spotify_song().await;
+            let song = get_spotify_song(channel_name).await;
             match song {
                 Ok(s) => {
                     if s.is_playing {
@@ -191,7 +189,7 @@ async fn reply_message(user_msg: &str) -> Result<String, ()> {
             };
         }
         Some(&"?slink") => {
-            let song = get_spotify_song().await;
+            let song = get_spotify_song(channel_name).await;
             match song {
                 Ok(s) => {
                     if s.is_playing {
@@ -201,7 +199,7 @@ async fn reply_message(user_msg: &str) -> Result<String, ()> {
                     }
                 }
                 Err(e) => {
-                    println!("--error-- {:?}", e);
+                    println!("{:?}", e);
                     return Err(());
                 }
             };
@@ -236,48 +234,14 @@ struct Artist {
     name: String,
 }
 
-async fn get_spotify_song() -> Result<SongResponse, Box<dyn std::error::Error>> {
+async fn get_spotify_song(channel_name: &str) -> Result<SongResponse, Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    let access_token = get_spotify_access_token().await?;
-    let res = client
-        .get("https://api.spotify.com/v1/me/player/currently-playing")
-        .bearer_auth(access_token)
-        .send()
-        .await?
-        .json::<SongResponse>()
-        .await?;
+    let url = dotenv::var("WEB_URI").unwrap() + "/api/spotify/song";
+    let params = [("channel_name", channel_name)];
+    let url = reqwest::Url::parse_with_params(url.as_str(), &params)?;
+    let res = client.get(url).send().await?.json::<SongResponse>().await?;
 
     return Ok(res);
-}
-
-#[derive(Deserialize, Debug)]
-struct SpotifyAccessTokenResponse {
-    access_token: String,
-}
-
-async fn get_spotify_access_token() -> Result<String, Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    let spotify_client_id = dotenv::var("SPOTIFY_CLIENT_ID").unwrap();
-    let spotify_client_secret = dotenv::var("SPOTIFY_CLIENT_SECRET").unwrap();
-    let spotify_refresh_token = dotenv::var("SPOTIFY_REFRESH_TOKEN").unwrap();
-    let encoded_client_details = BASE64_STANDARD
-        .encode(format!("{}:{}", spotify_client_id, spotify_client_secret).as_bytes());
-    let mut params = HashMap::new();
-    params.insert("grant_type", "refresh_token".to_owned());
-    params.insert("refresh_token", spotify_refresh_token);
-    let res = client
-        .post("https://accounts.spotify.com/api/token")
-        .form(&params)
-        .header(
-            "Authorization",
-            "Basic ".to_owned() + encoded_client_details.as_str(),
-        )
-        .send()
-        .await?
-        .json::<SpotifyAccessTokenResponse>()
-        .await?;
-
-    return Ok(res.access_token);
 }
 
 fn parse_message(irc_message: &str) -> Option<MessageResponse> {

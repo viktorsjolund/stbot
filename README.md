@@ -1,0 +1,1 @@
+See [stbot-web](https://github.com/ViktorSjolund/stbot-web) for the web application. 

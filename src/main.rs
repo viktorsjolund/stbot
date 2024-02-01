@@ -57,10 +57,7 @@ async fn main() {
         "PASS {}",
         dotenv::var("TWITCH_OAUTH_TOKEN").unwrap()
     ));
-    let nick = Message::text(format!(
-        "NICK {}",
-        dotenv::var("TWITCH_BOT_NICK").unwrap()
-    ));
+    let nick = Message::text(format!("NICK {}", dotenv::var("TWITCH_BOT_NICK").unwrap()));
     let join = Message::text(format!(
         "JOIN #{}",
         dotenv::var("TWITCH_CHANNEL_NAME").unwrap()
@@ -69,6 +66,14 @@ async fn main() {
     let _ = client.send_message(&pass);
     let _ = client.send_message(&nick);
     let _ = client.send_message(&join);
+    let mut active_users = get_active_users().await.unwrap().users;
+    for username in active_users.iter_mut() {
+        *username = format!("#{}", username)
+    }
+    if active_users.len() > 0 {
+        let join_active_users = Message::text(format!("JOIN {}", active_users.join(",")));
+        let _ = client.send_message(&join_active_users);
+    }
 
     let conn = Connection::connect(&addr, ConnectionProperties::default())
         .await
@@ -130,6 +135,23 @@ async fn main() {
             delivery.ack(BasicAckOptions::default()).await.unwrap();
         }
     }
+}
+
+#[derive(Deserialize, Debug)]
+struct ActiveUsersResponse {
+    users: Vec<String>,
+}
+
+async fn get_active_users() -> Result<ActiveUsersResponse, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let res = client
+        .get(dotenv::var("WEB_URI").unwrap() + "/api/active")
+        .send()
+        .await?
+        .json::<ActiveUsersResponse>()
+        .await?;
+
+    return Ok(res);
 }
 
 async fn generate_response(parsed_message: MessageResponse) -> Result<String, ()> {

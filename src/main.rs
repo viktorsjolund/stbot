@@ -97,10 +97,11 @@ async fn main() {
                             let messages: Vec<&str> =
                                 message_as_str.trim_end().split("\r\n").collect();
                             for m in messages.iter() {
+                                println!("[INFO] Message: {}", m);
                                 let parsed_message = parse_message(m).unwrap();
-                                println!("{:?}", parsed_message);
                                 let response = generate_response(parsed_message).await;
                                 if let Ok(r) = response {
+                                    println!("[INFO] Response: {}", r);
                                     let reply = Message::text(r);
                                     let _ = sender.lock().await.send_message(&reply);
                                 }
@@ -108,7 +109,7 @@ async fn main() {
                         }
                     }
                     Err(e) => {
-                        println!("An error occured: {:?}", e);
+                        panic!("[ERROR] Websocket Error: {:?}", e);
                     }
                 }
             }
@@ -205,7 +206,7 @@ async fn reply_message(user_msg: &str, channel_name: &str) -> Result<String, ()>
                     }
                 }
                 Err(e) => {
-                    println!("{:?}", e);
+                    println!("[ERROR] Could not get song: {:?}", e);
                     return Err(());
                 }
             };
@@ -221,7 +222,7 @@ async fn reply_message(user_msg: &str, channel_name: &str) -> Result<String, ()>
                     }
                 }
                 Err(e) => {
-                    println!("{:?}", e);
+                    println!("[ERROR] Could not get song: {:?}", e);
                     return Err(());
                 }
             };
@@ -267,7 +268,6 @@ async fn get_spotify_song(channel_name: &str) -> Result<SongResponse, Box<dyn st
 }
 
 fn parse_message(irc_message: &str) -> Option<MessageResponse> {
-    println!("raw msg: {:?}", irc_message);
     let mut pm = MessageResponse {
         ..Default::default()
     };
@@ -458,14 +458,14 @@ fn parse_command(raw_command_component: &str) -> Option<Command> {
             };
         }
         "RECONNECT" => {
-            println!("The Twitch IRC server is about to terminate the connection for maintenance.");
+            println!("[INFO] The Twitch IRC server is about to terminate the connection for maintenance.");
             pc.command = match command_parts.get(0) {
                 Some(s) => Some(s.to_string()),
                 None => None,
             };
         }
         "421" => {
-            println!("Unsupported IRC command: {:?}", command_parts[2]);
+            println!("[INFO] Unsupported IRC command: {:?}", command_parts[2]);
             return None;
         }
         "001" => {
@@ -479,11 +479,11 @@ fn parse_command(raw_command_component: &str) -> Option<Command> {
             };
         }
         "002" | "003" | "004" | "353" | "366" | "372" | "375" | "376" => {
-            println!("numeric message: {:?}", command_parts[0]);
+            println!("[INFO] Numeric message: {:?}", command_parts[0]);
             return None;
         }
         _ => {
-            println!("\nUnexpected command: {:?}\n", command_parts[0]);
+            println!("[INFO] Unexpected command: {:?}", command_parts[0]);
             return None;
         }
     }

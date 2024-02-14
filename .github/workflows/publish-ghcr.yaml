@@ -10,6 +10,7 @@ jobs:
       - uses: actions/checkout@v3
       - name: Build and push the image
         run: |
+          echo "TWITCH_CHANNEL_NAME: ${{ secrets.TWITCH_CHANNEL_NAME }}"
           docker login --username viktorsjolund --password ${{ secrets.GH_PAT }} ghcr.io
-          docker build . --build-arg TWITCH_OAUTH_TOKEN=${{ vars.TWITCH_OAUTH_TOKEN }} --build-arg TWITCH_BOT_NICK=${{ vars.TWITCH_BOT_NICK }} --build-arg TWITCH_CHANNEL_NAME=${{ vars.TWITCH_CHANNEL_NAME }} --build-arg SPOTIFY_CLIENT_ID=${{ vars.SPOTIFY_CLIENT_ID }} --build-arg SPOTIFY_CLIENT_SECRET=${{ vars.SPOTIFY_CLIENT_SECRET }} --build-arg WEB_URI=${{ vars.WEB_URI }} --build-arg AMQP_ADDR=${{ vars.AMQP_ADDR }} --tag ghcr.io/viktorsjolund/stbot:latest
+          docker build . --build-arg TWITCH_OAUTH_TOKEN=${{ secrets.TWITCH_OAUTH_TOKEN }} --build-arg TWITCH_BOT_NICK=${{ secrets.TWITCH_BOT_NICK }} --build-arg TWITCH_CHANNEL_NAME=${{ secrets.TWITCH_CHANNEL_NAME }} --build-arg SPOTIFY_CLIENT_ID=${{ secrets.SPOTIFY_CLIENT_ID }} --build-arg SPOTIFY_CLIENT_SECRET=${{ secrets.SPOTIFY_CLIENT_SECRET }} --build-arg WEB_URI=${{ secrets.WEB_URI }} --build-arg AMQP_ADDR=${{ secrets.AMQP_ADDR }} --tag ghcr.io/viktorsjolund/stbot:latest
           docker push ghcr.io/viktorsjolund/stbot:latest

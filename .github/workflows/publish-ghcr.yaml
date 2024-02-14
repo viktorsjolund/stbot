@@ -7,6 +7,14 @@ jobs:
   build_and_publish:
     runs-on: ubuntu-latest
     environment: production
+    env:
+      TWITCH_OAUTH_TOKEN: ${{ vars.TWITCH_OAUTH_TOKEN }}
+      TWITCH_CHANNEL_NAME: ${{ vars.TWITCH_CHANNEL_NAME }}
+      TWITCH_BOT_NICK: ${{ vars.TWITCH_BOT_NICK }}
+      SPOTIFY_CLIENT_ID: ${{ vars.SPOTIFY_CLIENT_ID }}
+      SPOTIFY_CLIENT_SECRET: ${{ vars.SPOTIFY_CLIENT_SECRET }}
+      WEB_URI: ${{ vars.WEB_URI }}
+      AMQP_ADDR: ${{ vars.AMQP_ADDR }}
     steps:
       - uses: actions/checkout@v3
       - name: Build and push the image
@@ -14,11 +22,3 @@ jobs:
           docker login --username viktorsjolund --password ${{ secrets.GH_PAT }} ghcr.io
           docker build . --tag ghcr.io/viktorsjolund/stbot:latest
           docker push ghcr.io/viktorsjolund/stbot:latest
-        env:
-          TWITCH_OAUTH_TOKEN: ${{ vars.TWITCH_OAUTH_TOKEN }}
-          TWITCH_CHANNEL_NAME: ${{ vars.TWITCH_CHANNEL_NAME }}
-          TWITCH_BOT_NICK: ${{ vars.TWITCH_BOT_NICK }}
-          SPOTIFY_CLIENT_ID: ${{ vars.SPOTIFY_CLIENT_ID }}
-          SPOTIFY_CLIENT_SECRET: ${{ vars.SPOTIFY_CLIENT_SECRET }}
-          WEB_URI: ${{ vars.WEB_URI }}
-          AMQP_ADDR: ${{ vars.AMQP_ADDR }}

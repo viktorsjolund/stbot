@@ -9,9 +9,8 @@ edition = "2021"
 base64 = "0.21.7"
 dotenv = "0.15.0"
 futures = "0.3.30"
-futures-lite = "2.2.0"
 lapin = "2.3.1"
 reqwest = { version = "0.11.23", features = ["json"] }
 serde = { version = "1.0.195", features = ["derive"] }
 tokio = { version = "1.35.1", features = ["full"] }
-websocket = "0.27.0"
+tokio-tungstenite = "0.21.0"

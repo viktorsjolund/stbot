@@ -1,11 +1,11 @@
-use futures_lite::stream::StreamExt;
+use futures::{SinkExt, StreamExt};
 use lapin::{options::*, types::FieldTable, Connection, ConnectionProperties};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::str;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use websocket::{ws::dataframe::DataFrame, ClientBuilder, Message};
+use tokio_tungstenite::connect_async;
 
 #[derive(Default, Debug)]
 struct MessageResponse {
@@ -46,77 +46,79 @@ struct Command {
 
 #[tokio::main]
 async fn main() {
-    let addr = dotenv::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://localhost:5672".into());
-    let mut client = ClientBuilder::new("ws://irc-ws.chat.twitch.tv:80")
-        .unwrap()
-        .connect_insecure()
+    let amqp_addr = dotenv::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://localhost:5672".into());
+    let amqp_conn = Connection::connect(&amqp_addr, ConnectionProperties::default())
+        .await
         .unwrap();
+    let channel = amqp_conn.create_channel().await.unwrap();
 
-    let cap_req = Message::text("CAP REQ :twitch.tv/tags twitch.tv/commands");
-    let pass = Message::text(format!(
-        "PASS {}",
-        dotenv::var("TWITCH_OAUTH_TOKEN").unwrap()
-    ));
-    let nick = Message::text(format!("NICK {}", dotenv::var("TWITCH_BOT_NICK").unwrap()));
-    let join = Message::text(format!(
-        "JOIN #{}",
-        dotenv::var("TWITCH_CHANNEL_NAME").unwrap()
-    ));
-    let _ = client.send_message(&cap_req);
-    let _ = client.send_message(&pass);
-    let _ = client.send_message(&nick);
-    let _ = client.send_message(&join);
+    let (ws_stream, _) = connect_async("ws://irc-ws.chat.twitch.tv:80")
+        .await
+        .unwrap();
+    let (mut ws_tx, ws_rx) = ws_stream.split();
+
+    ws_tx
+        .send("CAP REQ :twitch.tv/tags twitch.tv/commands".into())
+        .await
+        .unwrap();
+    ws_tx
+        .send(format!("PASS {}", dotenv::var("TWITCH_OAUTH_TOKEN").unwrap()).into())
+        .await
+        .unwrap();
+    ws_tx
+        .send(format!("NICK {}", dotenv::var("TWITCH_BOT_NICK").unwrap()).into())
+        .await
+        .unwrap();
+    ws_tx
+        .send(format!("JOIN #{}", dotenv::var("TWITCH_CHANNEL_NAME").unwrap()).into())
+        .await
+        .unwrap();
     let mut active_users = get_active_users().await.unwrap().users;
     for username in active_users.iter_mut() {
         *username = format!("#{}", username)
     }
     if active_users.len() > 0 {
-        let join_active_users = Message::text(format!("JOIN {}", active_users.join(",")));
-        let _ = client.send_message(&join_active_users);
+        ws_tx
+            .send(format!("JOIN {}", active_users.join(",")).into())
+            .await
+            .unwrap();
     }
 
-    let conn = Connection::connect(&addr, ConnectionProperties::default())
-        .await
-        .unwrap();
-
-    let channel_a = conn.create_channel().await.unwrap();
-    let (reciever, sender) = client.split().unwrap();
-    let rec = Arc::new(Mutex::new(reciever));
-    let sen = Arc::new(Mutex::new(sender));
+    let sender = Arc::new(Mutex::new(ws_tx));
+    let reciever = Arc::new(Mutex::new(ws_rx));
 
     for _ in 0..1 {
-        let reciever = Arc::clone(&rec);
-        let sender = Arc::clone(&sen);
+        let reciever = reciever.clone();
+        let sender = sender.clone();
         tokio::spawn(async move {
-            for message in reciever.lock().await.incoming_messages() {
-                match message {
-                    Ok(owned_message) => {
-                        if owned_message.is_data() {
-                            let payload = &Message::from(owned_message).take_payload();
-                            let message_as_str = str::from_utf8(&payload).unwrap();
+            while let Some(result) = reciever.lock().await.next().await {
+                match result {
+                    Ok(message) => {
+                        if message.is_text() {
+                            let message_str = message.to_string();
                             let messages: Vec<&str> =
-                                message_as_str.trim_end().split("\r\n").collect();
+                                message_str.trim_end().split("\r\n").collect();
                             for m in messages.iter() {
                                 println!("[INFO] Message: {}", m);
                                 let parsed_message = parse_message(m).unwrap();
                                 let response = generate_response(parsed_message).await;
                                 if let Ok(r) = response {
                                     println!("[INFO] Response: {}", r);
-                                    let reply = Message::text(r);
-                                    let _ = sender.lock().await.send_message(&reply);
+                                    let _ =
+                                        sender.lock().await.send(r.into()).await.unwrap_or_else(
+                                            |e| eprintln!("[ERROR] Sender Error: {:?}", e),
+                                        );
                                 }
                             }
                         }
                     }
-                    Err(e) => {
-                        panic!("[ERROR] Websocket Error: {:?}", e);
-                    }
+                    Err(e) => panic!("[ERROR] Websocket Error: {:?}", e),
                 }
             }
         });
     }
 
-    let mut consumer = channel_a
+    let mut consumer = channel
         .basic_consume(
             "send",
             "bot",
@@ -127,12 +129,11 @@ async fn main() {
         .unwrap();
 
     for _ in 0..1 {
-        let sender = Arc::clone(&sen);
+        let sender = sender.clone();
         while let Some(delivery) = consumer.next().await {
             let delivery = delivery.expect("error in consumer");
             let data = str::from_utf8(&delivery.data).unwrap();
-            let msg = Message::text(data);
-            let _ = sender.lock().await.send_message(&msg);
+            sender.lock().await.send(data.into()).await.unwrap();
             delivery.ack(BasicAckOptions::default()).await.unwrap();
         }
     }
@@ -206,7 +207,7 @@ async fn reply_message(user_msg: &str, channel_name: &str) -> Result<String, ()>
                     }
                 }
                 Err(e) => {
-                    println!("[ERROR] Could not get song: {:?}", e);
+                    eprintln!("[ERROR] Could not get song: {:?}", e);
                     return Err(());
                 }
             };
@@ -222,7 +223,7 @@ async fn reply_message(user_msg: &str, channel_name: &str) -> Result<String, ()>
                     }
                 }
                 Err(e) => {
-                    println!("[ERROR] Could not get song: {:?}", e);
+                    eprintln!("[ERROR] Could not get song: {:?}", e);
                     return Err(());
                 }
             };

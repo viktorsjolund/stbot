@@ -1,7 +1,7 @@
 mod message_parser;
-use message_parser::{parse_message, MessageResponse};
 use futures::{SinkExt, StreamExt};
 use lapin::{options::*, types::FieldTable, Connection, ConnectionProperties};
+use message_parser::{parse_message, MessageResponse};
 use serde::Deserialize;
 use std::str;
 use std::sync::Arc;
@@ -34,7 +34,13 @@ async fn main() {
         .await
         .unwrap();
     ws_tx
-        .send(format!("JOIN #{}", dotenv::var("TWITCH_CHANNEL_NAME").unwrap()).into())
+        .send(
+            format!(
+                "JOIN #{}",
+                dotenv::var("TWITCH_CHANNEL_NAME").unwrap_or_default()
+            )
+            .into(),
+        )
         .await
         .unwrap();
     let mut active_users = get_active_users().await.unwrap().users;
@@ -166,7 +172,7 @@ async fn reply_message(user_msg: &str, channel_name: &str) -> Result<String, ()>
                 Ok(s) => {
                     if s.is_playing {
                         return Ok(format!("{} - {}", s.item.artists[0].name, s.item.name));
-                    } 
+                    }
                     return Ok("No song currently playing.".to_string());
                 }
                 Err(e) => {
@@ -181,7 +187,7 @@ async fn reply_message(user_msg: &str, channel_name: &str) -> Result<String, ()>
                 Ok(s) => {
                     if s.is_playing {
                         return Ok(s.item.external_urls.spotify);
-                    } 
+                    }
                     return Ok("No song currently playing.".to_string());
                 }
                 Err(e) => {

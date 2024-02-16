@@ -34,7 +34,6 @@ async fn main() {
         connection_attempts += 1;
 
         println!("[INFO] Connecting... (Attempt #{})", connection_attempts);
-        let (tx, rx) = mpsc::channel::<Option<String>>(100);
         let ws_connection_result = connect_async("ws://irc-ws.chat.twitch.tv:80").await;
         if let Err(e) = ws_connection_result {
             eprintln!("[ERROR] Connection failed: {:?}", e);
@@ -42,6 +41,7 @@ async fn main() {
         }
 
         println!("[INFO] Connected");
+        let (tx, rx) = mpsc::channel::<Option<String>>(100);
         let (ws_stream, _) = ws_connection_result.unwrap();
         let (ws_tx, ws_rx) = ws_stream.split();
         let consumer_th = tokio::spawn(start_consumer(channel.clone(), tx.clone()));

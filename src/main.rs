@@ -1,12 +1,16 @@
 mod message_parser;
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
+use lapin::Channel;
 use lapin::{options::*, types::FieldTable, Connection, ConnectionProperties};
 use message_parser::{parse_message, MessageResponse};
 use serde::Deserialize;
 use std::str;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio_tungstenite::connect_async;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::time::{sleep, Duration};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 #[tokio::main]
 async fn main() {
@@ -16,78 +20,63 @@ async fn main() {
         .unwrap();
     let channel = amqp_conn.create_channel().await.unwrap();
 
-    let (ws_stream, _) = connect_async("ws://irc-ws.chat.twitch.tv:80")
-        .await
-        .unwrap();
-    let (mut ws_tx, ws_rx) = ws_stream.split();
+    let mut connection_attempts = 0;
+    let mut delay = 0;
+    let max_connection_attempts = 12;
 
-    ws_tx
-        .send("CAP REQ :twitch.tv/tags twitch.tv/commands".into())
-        .await
-        .unwrap();
-    ws_tx
-        .send(format!("PASS {}", dotenv::var("TWITCH_OAUTH_TOKEN").unwrap()).into())
-        .await
-        .unwrap();
-    ws_tx
-        .send(format!("NICK {}", dotenv::var("TWITCH_BOT_NICK").unwrap()).into())
-        .await
-        .unwrap();
-    ws_tx
-        .send(
-            format!(
-                "JOIN #{}",
-                dotenv::var("TWITCH_CHANNEL_NAME").unwrap_or_default()
-            )
-            .into(),
-        )
-        .await
-        .unwrap();
-    let mut active_users = get_active_users().await.unwrap().users;
-    for username in active_users.iter_mut() {
-        *username = format!("#{}", username)
+    while connection_attempts < max_connection_attempts {
+        sleep(Duration::from_secs(delay)).await;
+        if delay == 0 {
+            delay += 1;
+        } else {
+            delay *= 2;
+        }
+        connection_attempts += 1;
+
+        println!("[INFO] Connecting... (Attempt #{})", connection_attempts);
+        let (tx, rx) = mpsc::channel::<Option<String>>(100);
+        let ws_connection_result = connect_async("ws://irc-ws.chat.twitch.tv:80").await;
+        if let Err(e) = ws_connection_result {
+            eprintln!("[ERROR] Connection failed: {:?}", e);
+            continue;
+        }
+
+        println!("[INFO] Connected");
+        let (ws_stream, _) = ws_connection_result.unwrap();
+        let (ws_tx, ws_rx) = ws_stream.split();
+        let consumer_th = tokio::spawn(start_consumer(channel.clone(), tx.clone()));
+
+        let (ws_rx_result, ws_tx) =
+            tokio::join!(start_ws(tx.clone(), ws_rx), start_reader(rx, ws_tx));
+        let ws_rx = ws_rx_result.unwrap();
+
+        println!("[INFO] Aborting consumer thread...");
+        consumer_th.abort();
+
+        println!("[INFO] Closing websocket connection...");
+        ws_tx.reunite(ws_rx).unwrap().close(None).await.unwrap();
+
+        connection_attempts = 0;
+        delay = 0;
     }
-    if active_users.len() > 0 {
-        ws_tx
-            .send(format!("JOIN {}", active_users.join(",")).into())
-            .await
-            .unwrap();
-    }
+}
 
-    let sender = Arc::new(Mutex::new(ws_tx));
-    let reciever = Arc::new(Mutex::new(ws_rx));
-
-    for _ in 0..1 {
-        let reciever = reciever.clone();
-        let sender = sender.clone();
-        tokio::spawn(async move {
-            while let Some(result) = reciever.lock().await.next().await {
-                match result {
-                    Ok(message) => {
-                        if message.is_text() {
-                            let message_str = message.to_string();
-                            let messages: Vec<&str> =
-                                message_str.trim_end().split("\r\n").collect();
-                            for m in messages.iter() {
-                                println!("[INFO] Message: {}", m);
-                                let parsed_message = parse_message(m).unwrap();
-                                let response = generate_response(parsed_message).await;
-                                if let Ok(r) = response {
-                                    println!("[INFO] Response: {}", r);
-                                    let _ =
-                                        sender.lock().await.send(r.into()).await.unwrap_or_else(
-                                            |e| eprintln!("[ERROR] Sender Error: {:?}", e),
-                                        );
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => panic!("[ERROR] Websocket Error: {:?}", e),
-                }
+async fn start_reader(
+    mut rx: Receiver<Option<String>>,
+    mut ws_tx: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+) -> SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message> {
+    loop {
+        sleep(Duration::from_millis(100)).await;
+        while let Some(m) = rx.recv().await {
+            match m {
+                Some(message) => ws_tx.send(message.into()).await.unwrap(),
+                None => return ws_tx,
             }
-        });
+        }
     }
+}
 
+async fn start_consumer(channel: Channel, tx: Sender<Option<String>>) {
     let mut consumer = channel
         .basic_consume(
             "send",
@@ -97,16 +86,83 @@ async fn main() {
         )
         .await
         .unwrap();
+    while let Some(delivery) = consumer.next().await {
+        let delivery = delivery.expect("error in consumer");
+        let data = str::from_utf8(&delivery.data).unwrap();
+        tx.send(Some(data.into())).await.unwrap();
+        delivery.ack(BasicAckOptions::default()).await.unwrap();
+    }
+}
 
-    for _ in 0..1 {
-        let sender = sender.clone();
-        while let Some(delivery) = consumer.next().await {
-            let delivery = delivery.expect("error in consumer");
-            let data = str::from_utf8(&delivery.data).unwrap();
-            sender.lock().await.send(data.into()).await.unwrap();
-            delivery.ack(BasicAckOptions::default()).await.unwrap();
+async fn start_ws(
+    tx: Sender<Option<String>>,
+    mut ws_rx: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+) -> Result<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>, ()> {
+    tx.send(Some("CAP REQ :twitch.tv/tags twitch.tv/commands".into()))
+        .await
+        .unwrap();
+    tx.send(Some(
+        format!("PASS {}", dotenv::var("TWITCH_OAUTH_TOKEN").unwrap()).into(),
+    ))
+    .await
+    .unwrap();
+    tx.send(Some(
+        format!("NICK {}", dotenv::var("TWITCH_BOT_NICK").unwrap()).into(),
+    ))
+    .await
+    .unwrap();
+    tx.send(Some(
+        format!(
+            "JOIN #{}",
+            dotenv::var("TWITCH_CHANNEL_NAME").unwrap_or_default()
+        )
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let mut active_users = get_active_users().await.unwrap().users;
+    for username in active_users.iter_mut() {
+        *username = format!("#{}", username)
+    }
+    if active_users.len() > 0 {
+        tx.send(Some(format!("JOIN {}", active_users.join(",")).into()))
+            .await
+            .unwrap();
+    }
+
+    while let Some(result) = ws_rx.next().await {
+        match result {
+            Ok(message) => {
+                if message.is_text() {
+                    let message_str = message.to_string();
+                    let messages: Vec<&str> = message_str.trim_end().split("\r\n").collect();
+                    for m in messages.iter() {
+                        println!("[INFO] Message: {}", m);
+                        let parsed_message = parse_message(m).unwrap();
+                        let response = generate_response(parsed_message).await;
+                        if let Ok(r) = response {
+                            match r.event {
+                                ResponseEvent::Message => {
+                                    let response_message = r.message.unwrap();
+                                    println!("[INFO] Response: {}", response_message);
+                                    let _ = tx.send(response_message.into()).await.unwrap_or_else(
+                                        |e| eprintln!("[ERROR] Sender Error: {:?}", e),
+                                    );
+                                }
+                                ResponseEvent::Reconnect => {
+                                    tx.send(None).await.unwrap();
+                                    return Ok(ws_rx);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => panic!("[ERROR] Websocket Error: {:?}", e),
         }
     }
+
+    return Ok(ws_rx);
 }
 
 #[derive(Deserialize, Debug)]
@@ -126,7 +182,17 @@ async fn get_active_users() -> Result<ActiveUsersResponse, Box<dyn std::error::E
     return Ok(res);
 }
 
-async fn generate_response(parsed_message: MessageResponse) -> Result<String, ()> {
+struct GeneratedResponse {
+    event: ResponseEvent,
+    message: Option<String>,
+}
+
+enum ResponseEvent {
+    Reconnect,
+    Message,
+}
+
+async fn generate_response(parsed_message: MessageResponse) -> Result<GeneratedResponse, ()> {
     let command = parsed_message
         .command
         .clone()
@@ -149,14 +215,26 @@ async fn generate_response(parsed_message: MessageResponse) -> Result<String, ()
 
     match command.as_str() {
         "PING" => {
-            return Ok(format!("PONG {}", message));
+            return Ok(GeneratedResponse {
+                event: ResponseEvent::Message,
+                message: Some(format!("PONG {}", message)),
+            });
         }
         "PRIVMSG" => {
             let reply = reply_message(message.as_str(), &channel[1..]).await?;
-            return Ok(format!(
-                "@reply-parent-msg-id={} PRIVMSG {} :{}",
-                message_id, channel, reply
-            ));
+            return Ok(GeneratedResponse {
+                event: ResponseEvent::Message,
+                message: Some(format!(
+                    "@reply-parent-msg-id={} PRIVMSG {} :{}",
+                    message_id, channel, reply
+                )),
+            });
+        }
+        "RECONNECT" => {
+            return Ok(GeneratedResponse {
+                event: ResponseEvent::Reconnect,
+                message: None,
+            });
         }
         _ => return Err(()),
     }

@@ -69,7 +69,10 @@ async fn start_reader(
         sleep(Duration::from_millis(100)).await;
         while let Some(m) = rx.recv().await {
             match m {
-                Some(message) => ws_tx.send(message.into()).await.unwrap(),
+                Some(message) => {
+                    println!("[INFO] Response: {}", message);
+                    ws_tx.send(message.into()).await.unwrap()
+                },
                 None => return ws_tx,
             }
         }
@@ -144,7 +147,6 @@ async fn start_ws(
                             match r.event {
                                 ResponseEvent::Message => {
                                     let response_message = r.message.unwrap();
-                                    println!("[INFO] Response: {}", response_message);
                                     let _ = tx.send(response_message.into()).await.unwrap_or_else(
                                         |e| eprintln!("[ERROR] Sender Error: {:?}", e),
                                     );

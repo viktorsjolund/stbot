@@ -31,14 +31,17 @@ async fn main() {
         } else {
             delay *= 2;
         }
-        connection_attempts += 1;
 
         println!("[INFO] Connecting... (Attempt #{})", connection_attempts);
         let ws_connection_result = connect_async("ws://irc-ws.chat.twitch.tv:80").await;
         if let Err(e) = ws_connection_result {
             eprintln!("[ERROR] Connection failed: {:?}", e);
+            connection_attempts += 1;
             continue;
         }
+
+        connection_attempts = 0;
+        delay = 0;
 
         println!("[INFO] Connected");
         let (tx, rx) = mpsc::channel::<Option<String>>(100);
@@ -46,18 +49,14 @@ async fn main() {
         let (ws_tx, ws_rx) = ws_stream.split();
         let consumer_th = tokio::spawn(start_consumer(channel.clone(), tx.clone()));
 
-        let (ws_rx_result, ws_tx) =
+        let (ws_rx, ws_tx) =
             tokio::join!(start_ws(tx.clone(), ws_rx), start_reader(rx, ws_tx));
-        let ws_rx = ws_rx_result.unwrap();
 
         println!("[INFO] Aborting consumer thread...");
         consumer_th.abort();
 
         println!("[INFO] Closing websocket connection...");
         ws_tx.reunite(ws_rx).unwrap().close(None).await.unwrap();
-
-        connection_attempts = 0;
-        delay = 0;
     }
 }
 
@@ -65,18 +64,17 @@ async fn start_reader(
     mut rx: Receiver<Option<String>>,
     mut ws_tx: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
 ) -> SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message> {
-    loop {
-        sleep(Duration::from_millis(100)).await;
-        while let Some(m) = rx.recv().await {
-            match m {
-                Some(message) => {
-                    println!("[INFO] Response: {}", message);
-                    ws_tx.send(message.into()).await.unwrap()
-                },
-                None => return ws_tx,
+    while let Some(m) = rx.recv().await {
+        match m {
+            Some(message) => {
+                println!("[INFO] Response: {}", message);
+                ws_tx.send(message.into()).await.unwrap()
             }
+            None => return ws_tx,
         }
     }
+
+    return ws_tx;
 }
 
 async fn start_consumer(channel: Channel, tx: Sender<Option<String>>) {
@@ -90,7 +88,7 @@ async fn start_consumer(channel: Channel, tx: Sender<Option<String>>) {
         .await
         .unwrap();
     while let Some(delivery) = consumer.next().await {
-        let delivery = delivery.expect("error in consumer");
+        let delivery = delivery.expect("[ERROR] Error in consumer");
         let data = str::from_utf8(&delivery.data).unwrap();
         tx.send(Some(data.into())).await.unwrap();
         delivery.ack(BasicAckOptions::default()).await.unwrap();
@@ -100,7 +98,7 @@ async fn start_consumer(channel: Channel, tx: Sender<Option<String>>) {
 async fn start_ws(
     tx: Sender<Option<String>>,
     mut ws_rx: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-) -> Result<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>, ()> {
+) -> SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>> {
     tx.send(Some("CAP REQ :twitch.tv/tags twitch.tv/commands".into()))
         .await
         .unwrap();
@@ -114,15 +112,10 @@ async fn start_ws(
     ))
     .await
     .unwrap();
-    tx.send(Some(
-        format!(
-            "JOIN #{}",
-            dotenv::var("TWITCH_CHANNEL_NAME").unwrap_or_default()
-        )
-        .into(),
-    ))
-    .await
-    .unwrap();
+    let twitch_ch_name = dotenv::var("TWITCH_CHANNEL_NAME");
+    if let Ok(ch) = twitch_ch_name {
+        tx.send(Some(format!("JOIN #{}", ch).into())).await.unwrap();
+    }
     let mut active_users = get_active_users().await.unwrap().users;
     for username in active_users.iter_mut() {
         *username = format!("#{}", username)
@@ -141,7 +134,7 @@ async fn start_ws(
                     let messages: Vec<&str> = message_str.trim_end().split("\r\n").collect();
                     for m in messages.iter() {
                         println!("[INFO] Message: {}", m);
-                        let parsed_message = parse_message(m).unwrap();
+                        let parsed_message = parse_message(m);
                         let response = generate_response(parsed_message).await;
                         if let Ok(r) = response {
                             match r.event {
@@ -153,7 +146,7 @@ async fn start_ws(
                                 }
                                 ResponseEvent::Reconnect => {
                                     tx.send(None).await.unwrap();
-                                    return Ok(ws_rx);
+                                    return ws_rx;
                                 }
                             }
                         }
@@ -164,7 +157,7 @@ async fn start_ws(
         }
     }
 
-    return Ok(ws_rx);
+    return ws_rx;
 }
 
 #[derive(Deserialize, Debug)]
@@ -244,42 +237,41 @@ async fn generate_response(parsed_message: MessageResponse) -> Result<GeneratedR
 
 async fn reply_message(user_msg: &str, channel_name: &str) -> Result<String, ()> {
     let tokens: Vec<&str> = user_msg.split(" ").collect();
-
     match tokens.get(0) {
-        Some(&"?song") => {
-            let song = get_spotify_song(channel_name).await;
-            match song {
-                Ok(s) => {
-                    if s.is_playing {
-                        return Ok(format!("{} - {}", s.item.artists[0].name, s.item.name));
+        Some(command) => match command.to_owned() {
+            "?song" => {
+                let song = get_spotify_song(channel_name).await;
+                match song {
+                    Ok(s) => {
+                        if s.is_playing {
+                            return Ok(format!("{} - {}", s.item.artists[0].name, s.item.name));
+                        }
+                        return Ok("No song currently playing".to_string());
                     }
-                    return Ok("No song currently playing.".to_string());
-                }
-                Err(e) => {
-                    eprintln!("[ERROR] Could not get song: {:?}", e);
-                    return Err(());
-                }
-            };
-        }
-        Some(&"?slink") => {
-            let song = get_spotify_song(channel_name).await;
-            match song {
-                Ok(s) => {
-                    if s.is_playing {
-                        return Ok(s.item.external_urls.spotify);
+                    Err(e) => {
+                        eprintln!("[ERROR] Could not get song: {:?}", e);
+                        return Err(());
                     }
-                    return Ok("No song currently playing.".to_string());
-                }
-                Err(e) => {
-                    eprintln!("[ERROR] Could not get song: {:?}", e);
-                    return Err(());
-                }
-            };
-        }
-        None => {
-            return Err(());
-        }
-        _ => return Err(()),
+                };
+            }
+            "?slink" => {
+                let song = get_spotify_song(channel_name).await;
+                match song {
+                    Ok(s) => {
+                        if s.is_playing {
+                            return Ok(s.item.external_urls.spotify);
+                        }
+                        return Ok("No song currently playing".to_string());
+                    }
+                    Err(e) => {
+                        eprintln!("[ERROR] Could not get song: {:?}", e);
+                        return Err(());
+                    }
+                };
+            }
+            _ => return Err(()),
+        },
+        None => return Err(()),
     }
 }
 

@@ -37,7 +37,7 @@ pub struct Command {
     bot_command_params: Option<String>,
 }
 
-pub fn parse_message(irc_message: &str) -> Option<MessageResponse> {
+pub fn parse_message(irc_message: &str) -> MessageResponse {
     let mut pm = MessageResponse {
         ..Default::default()
     };
@@ -91,7 +91,7 @@ pub fn parse_message(irc_message: &str) -> Option<MessageResponse> {
         }
     }
 
-    return Some(pm);
+    return pm;
 }
 
 fn parse_tags(tags: &str) -> Tags {

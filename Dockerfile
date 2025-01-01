@@ -17,6 +17,6 @@ ENV SPOTIFY_CLIENT_SECRET=$SPOTIFY_CLIENT_SECRET
 ENV WEB_URI=$WEB_URI
 ENV AMQP_ADDR=$AMQP_ADDR
 
-RUN cargo install --path .
+RUN cargo install --path . --target=aarch64-unknown-linux-gnu 
 
 CMD ["rust-ws"]

@@ -1,4 +1,4 @@
-FROM rust:1.83.0-bookworm
+FROM --platform=linux/arm64 rust:1.83.0-bookworm
 
 ARG TWITCH_OAUTH_TOKEN
 ARG TWITCH_BOT_NICK

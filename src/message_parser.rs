@@ -8,7 +8,7 @@ pub struct MessageResponse {
     pub parameters: Option<String>,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct Tags {
     badges: Option<HashMap<String, String>>,
     emote_sets: Option<HashMap<String, String>>,
@@ -16,7 +16,7 @@ pub struct Tags {
     pub other: Option<HashMap<String, String>>,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 #[allow(dead_code)]
 struct Emote {
     start_position: Option<String>,
@@ -304,3 +304,4 @@ fn parse_parameters(raw_parameters_component: &str, command: Command) -> Command
 
     return command;
 }
+

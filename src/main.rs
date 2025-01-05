@@ -4,10 +4,15 @@ use futures::{SinkExt, StreamExt};
 use lapin::Channel;
 use lapin::{options::*, types::FieldTable, Connection, ConnectionProperties};
 use message_parser::{parse_message, MessageResponse};
+use reqwest::StatusCode;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::str;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
@@ -49,8 +54,7 @@ async fn main() {
         let (ws_tx, ws_rx) = ws_stream.split();
         let consumer_th = tokio::spawn(start_consumer(channel.clone(), tx.clone()));
 
-        let (ws_rx, ws_tx) =
-            tokio::join!(start_ws(tx.clone(), ws_rx), start_reader(rx, ws_tx));
+        let (ws_rx, ws_tx) = tokio::join!(start_ws(tx.clone(), ws_rx), start_reader(rx, ws_tx));
 
         println!("[INFO] Aborting consumer thread...");
         consumer_th.abort();
@@ -125,6 +129,9 @@ async fn start_ws(
             .await
             .unwrap();
     }
+    let mut skip_channels = HashMap::<String, Arc<Mutex<Vec<String>>>>::new();
+    let mut handles: Vec<JoinHandle<()>> = Vec::new();
+    let mut last_skip = SystemTime::now();
 
     while let Some(result) = ws_rx.next().await {
         match result {
@@ -148,7 +155,20 @@ async fn start_ws(
                                     tx.send(None).await.unwrap();
                                     return ws_rx;
                                 }
-                            }
+                                ResponseEvent::Skip => {
+                                    let min_secs_between_skips = Duration::from_secs(10);
+                                    if last_skip.elapsed().unwrap() >= min_secs_between_skips {
+                                        handle_skip(
+                                            &mut skip_channels,
+                                            r,
+                                            &mut handles,
+                                            &mut last_skip,
+                                            &tx,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            };
                         }
                     }
                 }
@@ -158,6 +178,76 @@ async fn start_ws(
     }
 
     return ws_rx;
+}
+
+async fn handle_skip(
+    skip_channels: &mut HashMap<String, Arc<Mutex<Vec<String>>>>,
+    gr: GeneratedResponse,
+    handles: &mut Vec<JoinHandle<()>>,
+    last_skip: &mut SystemTime,
+    tx: &Sender<Option<String>>,
+) {
+    let channel_name = gr.channel_name.unwrap();
+    if let None = skip_channels.get(&channel_name) {
+        skip_channels.insert(channel_name.clone(), Arc::new(Mutex::new(Vec::new())));
+    }
+    let current_skip_users = skip_channels.get_mut(&channel_name).unwrap();
+    let username = gr.username.unwrap();
+    if !current_skip_users.lock().unwrap().contains(&username) {
+        current_skip_users.lock().unwrap().push(username.clone());
+        // TODO: change required votes to 5 or sum
+        let required_skips = 3;
+        if current_skip_users.lock().unwrap().len() >= required_skips {
+            let res = skip_current_song(&channel_name.clone()).await;
+            match res {
+                Ok(s) => {
+                    if s.is_success() {
+                        let _ = tx
+                            .send(
+                                format!("PRIVMSG {} :Vote skip passed", channel_name.clone(),)
+                                    .into(),
+                            )
+                            .await
+                            .unwrap_or_else(|e| eprintln!("[ERROR] Sender Error: {:?}", e));
+                        *last_skip = SystemTime::now();
+                        for h in handles {
+                            h.abort();
+                        }
+                        current_skip_users.lock().unwrap().clear();
+                    } else {
+                        println!("[INFO] Could not skip song, status code: {}", s);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[ERROR] Error skipping song: {:?}", e);
+                }
+            }
+        } else {
+            let current_skip_users = Arc::clone(&current_skip_users);
+            let username = username.clone();
+            let handle = tokio::spawn(async move {
+                sleep(Duration::from_secs(30)).await;
+                let i = current_skip_users
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .position(|n| *n == username)
+                    .unwrap();
+                current_skip_users.lock().unwrap().remove(i);
+            });
+            handles.push(handle);
+        }
+    }
+}
+
+async fn skip_current_song(channel_name: &str) -> Result<StatusCode, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let url = dotenv::var("WEB_URI").unwrap() + "/api/spotify/skip";
+    let params = [("channel_name", channel_name)];
+    let url = reqwest::Url::parse_with_params(url.as_str(), &params)?;
+    let status = client.post(url).send().await?.status();
+
+    return Ok(status);
 }
 
 #[derive(Deserialize, Debug)]
@@ -177,14 +267,24 @@ async fn get_active_users() -> Result<ActiveUsersResponse, Box<dyn std::error::E
     return Ok(res);
 }
 
+#[derive(Default)]
 struct GeneratedResponse {
     event: ResponseEvent,
     message: Option<String>,
+    username: Option<String>,
+    channel_name: Option<String>,
 }
 
 enum ResponseEvent {
     Reconnect,
     Message,
+    Skip,
+}
+
+impl Default for ResponseEvent {
+    fn default() -> Self {
+        Self::Message
+    }
 }
 
 async fn generate_response(parsed_message: MessageResponse) -> Result<GeneratedResponse, ()> {
@@ -199,10 +299,17 @@ async fn generate_response(parsed_message: MessageResponse) -> Result<GeneratedR
         .and_then(|c| c.channel)
         .unwrap_or_default();
     let message = parsed_message.parameters.unwrap_or_default();
-    let message_id = parsed_message
-        .tags
-        .and_then(|t| t.other)
+    let tags = parsed_message.tags.and_then(|t| t.other);
+    let message_id = tags
+        .clone()
         .and_then(|o| match o.get("id") {
+            Some(s) => Some(s.to_owned()),
+            None => None,
+        })
+        .unwrap_or_default();
+    let display_name = tags
+        .clone()
+        .and_then(|o| match o.get("display-name") {
             Some(s) => Some(s.to_owned()),
             None => None,
         })
@@ -213,29 +320,58 @@ async fn generate_response(parsed_message: MessageResponse) -> Result<GeneratedR
             return Ok(GeneratedResponse {
                 event: ResponseEvent::Message,
                 message: Some(format!("PONG {}", message)),
+                ..Default::default()
             });
         }
         "PRIVMSG" => {
             let reply = reply_message(message.as_str(), &channel[1..]).await?;
-            return Ok(GeneratedResponse {
-                event: ResponseEvent::Message,
-                message: Some(format!(
-                    "@reply-parent-msg-id={} PRIVMSG {} :{}",
-                    message_id, channel, reply
-                )),
-            });
+            return match reply.reply_type {
+                ReplyType::Message => Ok(GeneratedResponse {
+                    event: ResponseEvent::Message,
+                    message: Some(format!(
+                        "@reply-parent-msg-id={} PRIVMSG {} :{}",
+                        message_id,
+                        channel,
+                        reply.message.unwrap()
+                    )),
+                    ..Default::default()
+                }),
+                ReplyType::Skip => Ok(GeneratedResponse {
+                    event: ResponseEvent::Skip,
+                    username: Some(display_name),
+                    message: None,
+                    channel_name: Some(channel),
+                }),
+            };
         }
         "RECONNECT" => {
             return Ok(GeneratedResponse {
                 event: ResponseEvent::Reconnect,
-                message: None,
+                ..Default::default()
             });
         }
         _ => return Err(()),
     }
 }
 
-async fn reply_message(user_msg: &str, channel_name: &str) -> Result<String, ()> {
+#[derive(Default)]
+struct Reply {
+    message: Option<String>,
+    reply_type: ReplyType,
+}
+
+enum ReplyType {
+    Message,
+    Skip,
+}
+
+impl Default for ReplyType {
+    fn default() -> Self {
+        ReplyType::Message
+    }
+}
+
+async fn reply_message(user_msg: &str, channel_name: &str) -> Result<Reply, ()> {
     let tokens: Vec<&str> = user_msg.split(" ").collect();
     match tokens.get(0) {
         Some(command) => match command.to_owned() {
@@ -244,9 +380,18 @@ async fn reply_message(user_msg: &str, channel_name: &str) -> Result<String, ()>
                 match song {
                     Ok(s) => {
                         if s.is_playing {
-                            return Ok(format!("{} - {}", s.item.artists[0].name, s.item.name));
+                            return Ok(Reply {
+                                message: Some(format!(
+                                    "{} - {}",
+                                    s.item.artists[0].name, s.item.name
+                                )),
+                                ..Default::default()
+                            });
                         }
-                        return Ok("No song currently playing".to_string());
+                        return Ok(Reply {
+                            message: Some("No song currently playing".to_string()),
+                            ..Default::default()
+                        });
                     }
                     Err(e) => {
                         eprintln!("[ERROR] Could not get song: {:?}", e);
@@ -259,15 +404,27 @@ async fn reply_message(user_msg: &str, channel_name: &str) -> Result<String, ()>
                 match song {
                     Ok(s) => {
                         if s.is_playing {
-                            return Ok(s.item.external_urls.spotify);
+                            return Ok(Reply {
+                                message: Some(s.item.external_urls.spotify),
+                                ..Default::default()
+                            });
                         }
-                        return Ok("No song currently playing".to_string());
+                        return Ok(Reply {
+                            message: Some("No song currently playing".to_string()),
+                            ..Default::default()
+                        });
                     }
                     Err(e) => {
                         eprintln!("[ERROR] Could not get song: {:?}", e);
                         return Err(());
                     }
                 };
+            }
+            "?skip" => {
+                return Ok(Reply {
+                    reply_type: ReplyType::Skip,
+                    ..Default::default()
+                });
             }
             _ => return Err(()),
         },

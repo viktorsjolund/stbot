@@ -196,7 +196,7 @@ async fn handle_skip(
     if !current_skip_users.lock().unwrap().contains(&username) {
         current_skip_users.lock().unwrap().push(username.clone());
         // TODO: change required votes to 5 or sum
-        let required_skips = 3;
+        let required_skips = 5;
         if current_skip_users.lock().unwrap().len() >= required_skips {
             let res = skip_current_song(&channel_name.clone()).await;
             match res {
@@ -399,7 +399,7 @@ async fn reply_message(user_msg: &str, channel_name: &str) -> Result<Reply, ()> 
                     }
                 };
             }
-            "?slink" => {
+            "?slink" | "?songlink" => {
                 let song = get_spotify_song(channel_name).await;
                 match song {
                     Ok(s) => {
@@ -426,10 +426,68 @@ async fn reply_message(user_msg: &str, channel_name: &str) -> Result<Reply, ()> 
                     ..Default::default()
                 });
             }
+            "?skipon" => {
+                let res = enable_song_skip(&channel_name).await;
+                match res {
+                    Ok(s) => {
+                        if s.is_success() {
+                            return Ok(Reply {
+                                reply_type: ReplyType::Message,
+                                message: Some("Vote skip is now enabled".into()),
+                                ..Default::default()
+                            });
+                        }
+
+                        return Err(());
+                    }
+                    Err(_) => Err(()),
+                }
+            }
+            "?skipoff" => {
+                let res = disable_song_skip(&channel_name).await;
+                match res {
+                    Ok(s) => {
+                        if s.is_success() {
+                            return Ok(Reply {
+                                reply_type: ReplyType::Message,
+                                message: Some("Vote skip is now disabled".into()),
+                                ..Default::default()
+                            });
+                        }
+
+                        return Err(());
+                    }
+                    Err(_) => Err(()),
+                }
+            }
             _ => return Err(()),
         },
         None => return Err(()),
     }
+}
+
+async fn enable_song_skip(
+    channel_name: &str,
+) -> Result<reqwest::StatusCode, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let url = dotenv::var("WEB_URI").unwrap() + "/api/commands/skip/add";
+    let params = [("channel_name", channel_name)];
+    let url = reqwest::Url::parse_with_params(url.as_str(), &params)?;
+    let status = client.post(url).send().await?.status();
+
+    return Ok(status);
+}
+
+async fn disable_song_skip(
+    channel_name: &str,
+) -> Result<reqwest::StatusCode, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let url = dotenv::var("WEB_URI").unwrap() + "/api/commands/skip/remove";
+    let params = [("channel_name", channel_name)];
+    let url = reqwest::Url::parse_with_params(url.as_str(), &params)?;
+    let status = client.post(url).send().await?.status();
+
+    return Ok(status);
 }
 
 #[derive(Deserialize, Debug)]

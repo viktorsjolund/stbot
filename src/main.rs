@@ -143,32 +143,42 @@ async fn start_ws(
                         println!("[INFO] Message: {}", m);
                         let parsed_message = parse_message(m);
                         let response = generate_response(parsed_message).await;
-                        if let Ok(r) = response {
-                            match r.event {
-                                ResponseEvent::Message => {
-                                    let response_message = r.message.unwrap();
-                                    let _ = tx.send(response_message.into()).await.unwrap_or_else(
-                                        |e| eprintln!("[ERROR] Sender Error: {:?}", e),
-                                    );
+                        match response {
+                            Ok(gr) => {
+                                if let Some(r) = gr {
+                                    match r.event {
+                                        ResponseEvent::Message => {
+                                            let response_message = r.message.unwrap();
+                                            let _ = tx
+                                                .send(response_message.into())
+                                                .await
+                                                .unwrap_or_else(|e| {
+                                                    eprintln!("[ERROR] Sender Error: {:?}", e)
+                                                });
+                                        }
+                                        ResponseEvent::Reconnect => {
+                                            tx.send(None).await.unwrap();
+                                            return ws_rx;
+                                        }
+                                        ResponseEvent::Skip => {
+                                            let min_secs_between_skips = Duration::from_secs(10);
+                                            if last_skip.elapsed().unwrap()
+                                                >= min_secs_between_skips
+                                            {
+                                                handle_skip(
+                                                    &mut skip_channels,
+                                                    r,
+                                                    &mut handles,
+                                                    &mut last_skip,
+                                                    &tx,
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                    };
                                 }
-                                ResponseEvent::Reconnect => {
-                                    tx.send(None).await.unwrap();
-                                    return ws_rx;
-                                }
-                                ResponseEvent::Skip => {
-                                    let min_secs_between_skips = Duration::from_secs(10);
-                                    if last_skip.elapsed().unwrap() >= min_secs_between_skips {
-                                        handle_skip(
-                                            &mut skip_channels,
-                                            r,
-                                            &mut handles,
-                                            &mut last_skip,
-                                            &tx,
-                                        )
-                                        .await;
-                                    }
-                                }
-                            };
+                            }
+                            Err(e) => eprintln!("[ERROR] {}", e),
                         }
                     }
                 }
@@ -287,12 +297,15 @@ impl Default for ResponseEvent {
     }
 }
 
-async fn generate_response(parsed_message: MessageResponse) -> Result<GeneratedResponse, ()> {
+async fn generate_response(
+    parsed_message: MessageResponse,
+) -> Result<Option<GeneratedResponse>, String> {
     let command = parsed_message
         .command
         .clone()
         .and_then(|c| c.command)
         .unwrap_or_default();
+    // Has a # in front of the channel name
     let channel = parsed_message
         .command
         .clone()
@@ -314,44 +327,48 @@ async fn generate_response(parsed_message: MessageResponse) -> Result<GeneratedR
             None => None,
         })
         .unwrap_or_default();
-    let is_channel_owner = display_name == channel;
+    let is_channel_owner = format!("#{}", display_name.to_lowercase()) == channel.to_lowercase();
 
     match command.as_str() {
         "PING" => {
-            return Ok(GeneratedResponse {
+            return Ok(Some(GeneratedResponse {
                 event: ResponseEvent::Message,
                 message: Some(format!("PONG {}", message)),
                 ..Default::default()
-            });
+            }));
         }
         "PRIVMSG" => {
             let reply = reply_message(message.as_str(), &channel[1..], &is_channel_owner).await?;
-            return match reply.reply_type {
-                ReplyType::Message => Ok(GeneratedResponse {
-                    event: ResponseEvent::Message,
-                    message: Some(format!(
-                        "@reply-parent-msg-id={} PRIVMSG {} :{}",
-                        message_id,
-                        channel,
-                        reply.message.unwrap()
-                    )),
-                    ..Default::default()
-                }),
-                ReplyType::Skip => Ok(GeneratedResponse {
-                    event: ResponseEvent::Skip,
-                    username: Some(display_name),
-                    message: None,
-                    channel_name: Some(channel),
-                }),
-            };
+            if let Some(r) = reply {
+                return match r.reply_type {
+                    ReplyType::Message => Ok(Some(GeneratedResponse {
+                        event: ResponseEvent::Message,
+                        message: Some(format!(
+                            "@reply-parent-msg-id={} PRIVMSG {} :{}",
+                            message_id,
+                            channel,
+                            r.message.unwrap()
+                        )),
+                        ..Default::default()
+                    })),
+                    ReplyType::Skip => Ok(Some(GeneratedResponse {
+                        event: ResponseEvent::Skip,
+                        username: Some(display_name),
+                        message: None,
+                        channel_name: Some(channel),
+                    })),
+                };
+            } else {
+                return Ok(None);
+            }
         }
         "RECONNECT" => {
-            return Ok(GeneratedResponse {
+            return Ok(Some(GeneratedResponse {
                 event: ResponseEvent::Reconnect,
                 ..Default::default()
-            });
+            }));
         }
-        _ => return Err(()),
+        _ => Ok(None),
     }
 }
 
@@ -376,7 +393,7 @@ async fn reply_message(
     user_msg: &str,
     channel_name: &str,
     is_channel_owner: &bool,
-) -> Result<Reply, ()> {
+) -> Result<Option<Reply>, String> {
     let tokens: Vec<&str> = user_msg.split(" ").collect();
     match tokens.get(0) {
         Some(command) => match command.to_owned() {
@@ -385,22 +402,21 @@ async fn reply_message(
                 match song {
                     Ok(s) => {
                         if s.is_playing {
-                            return Ok(Reply {
+                            return Ok(Some(Reply {
                                 message: Some(format!(
                                     "{} - {}",
                                     s.item.artists[0].name, s.item.name
                                 )),
                                 ..Default::default()
-                            });
+                            }));
                         }
-                        return Ok(Reply {
+                        return Ok(Some(Reply {
                             message: Some("No song currently playing".to_string()),
                             ..Default::default()
-                        });
+                        }));
                     }
                     Err(e) => {
-                        eprintln!("[ERROR] Could not get song: {:?}", e);
-                        return Err(());
+                        return Err(format!("Could not get song: {:?}", e));
                     }
                 };
             }
@@ -409,71 +425,83 @@ async fn reply_message(
                 match song {
                     Ok(s) => {
                         if s.is_playing {
-                            return Ok(Reply {
+                            return Ok(Some(Reply {
                                 message: Some(s.item.external_urls.spotify),
                                 ..Default::default()
-                            });
+                            }));
                         }
-                        return Ok(Reply {
+                        return Ok(Some(Reply {
                             message: Some("No song currently playing".to_string()),
                             ..Default::default()
-                        });
+                        }));
                     }
                     Err(e) => {
-                        eprintln!("[ERROR] Could not get song: {:?}", e);
-                        return Err(());
+                        return Err(format!("Could not get song: {:?}", e));
                     }
                 };
             }
             "?skip" => {
-                return Ok(Reply {
+                return Ok(Some(Reply {
                     reply_type: ReplyType::Skip,
                     ..Default::default()
-                });
+                }));
             }
             "?skipon" => {
                 if !is_channel_owner {
-                    return Err(());
+                    return Err("User is not the channel owner.".into());
                 };
                 let res = enable_song_skip(&channel_name).await;
                 match res {
                     Ok(s) => {
                         if s.is_success() {
-                            return Ok(Reply {
+                            return Ok(Some(Reply {
                                 reply_type: ReplyType::Message,
                                 message: Some("Vote skip is now enabled".into()),
                                 ..Default::default()
-                            });
+                            }));
                         }
 
-                        return Err(());
+                        return Err(format!(
+                            "Enabling song skip failed with status code {}",
+                            s.to_string()
+                        ));
                     }
-                    Err(_) => Err(()),
+                    Err(e) => Err(format!("Enabling song skip failed: {:?}", e)),
                 }
             }
             "?skipoff" => {
                 if !is_channel_owner {
-                    return Err(());
+                    return Err("User is not the channel owner.".into());
                 };
                 let res = disable_song_skip(&channel_name).await;
                 match res {
                     Ok(s) => {
                         if s.is_success() {
-                            return Ok(Reply {
+                            return Ok(Some(Reply {
                                 reply_type: ReplyType::Message,
                                 message: Some("Vote skip is now disabled".into()),
                                 ..Default::default()
-                            });
+                            }));
                         }
 
-                        return Err(());
+                        return Err(format!(
+                            "Disabling song skip failed with status code {}",
+                            s.to_string()
+                        ));
                     }
-                    Err(_) => Err(()),
+                    Err(e) => Err(format!("Disabling song skip failed: {:?}", e)),
                 }
             }
-            _ => return Err(()),
+            "?commands" => {
+                return Ok(Some(Reply {
+                    reply_type: ReplyType::Message,
+                    message: Some("?song ?songlink ?slink ?skip ?skipon ?skipoff".into()),
+                    ..Default::default()
+                }));
+            }
+            _ => Ok(None),
         },
-        None => return Err(()),
+        None => Err("No token found.".into()),
     }
 }
 

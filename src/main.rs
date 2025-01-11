@@ -314,6 +314,7 @@ async fn generate_response(parsed_message: MessageResponse) -> Result<GeneratedR
             None => None,
         })
         .unwrap_or_default();
+    let is_channel_owner = display_name == channel;
 
     match command.as_str() {
         "PING" => {
@@ -324,7 +325,7 @@ async fn generate_response(parsed_message: MessageResponse) -> Result<GeneratedR
             });
         }
         "PRIVMSG" => {
-            let reply = reply_message(message.as_str(), &channel[1..]).await?;
+            let reply = reply_message(message.as_str(), &channel[1..], &is_channel_owner).await?;
             return match reply.reply_type {
                 ReplyType::Message => Ok(GeneratedResponse {
                     event: ResponseEvent::Message,
@@ -371,7 +372,11 @@ impl Default for ReplyType {
     }
 }
 
-async fn reply_message(user_msg: &str, channel_name: &str) -> Result<Reply, ()> {
+async fn reply_message(
+    user_msg: &str,
+    channel_name: &str,
+    is_channel_owner: &bool,
+) -> Result<Reply, ()> {
     let tokens: Vec<&str> = user_msg.split(" ").collect();
     match tokens.get(0) {
         Some(command) => match command.to_owned() {
@@ -427,6 +432,9 @@ async fn reply_message(user_msg: &str, channel_name: &str) -> Result<Reply, ()> 
                 });
             }
             "?skipon" => {
+                if !is_channel_owner {
+                    return Err(());
+                };
                 let res = enable_song_skip(&channel_name).await;
                 match res {
                     Ok(s) => {
@@ -444,6 +452,9 @@ async fn reply_message(user_msg: &str, channel_name: &str) -> Result<Reply, ()> 
                 }
             }
             "?skipoff" => {
+                if !is_channel_owner {
+                    return Err(());
+                };
                 let res = disable_song_skip(&channel_name).await;
                 match res {
                     Ok(s) => {

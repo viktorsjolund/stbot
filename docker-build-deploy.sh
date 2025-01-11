@@ -1,0 +1,3 @@
+. ./init-docker-env.sh
+docker build --build-arg TWITCH_OAUTH_TOKEN=$TWITCH_OAUTH_TOKEN --build-arg TWITCH_BOT_NICK=$TWITCH_BOT_NICK --build-arg SPOTIFY_CLIENT_ID=$SPOTIFY_CLIENT_ID --build-arg SPOTIFY_CLIENT_SECRET=$SPOTIFY_CLIENT_SECRET --build-arg WEB_URI=$WEB_URI --build-arg AMQP_ADDR=$AMQP_ADDR -t $DOCKER_TAG_NAME .
+docker push $DOCKER_TAG_NAME

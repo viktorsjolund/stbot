@@ -1,3 +1,5 @@
 .env.example
 /target
 /.github
+init-docker-env.sh
+docker-build-deploy.sh

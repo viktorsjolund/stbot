@@ -18,6 +18,8 @@ use tokio::time::{sleep, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
+const MAX_CONNECTION_ATTEMPTS: i32 = 12;
+
 #[tokio::main]
 async fn main() {
     let amqp_addr = dotenv::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://localhost:5672".into());
@@ -28,9 +30,8 @@ async fn main() {
 
     let mut connection_attempts = 0;
     let mut delay = 0;
-    let max_connection_attempts = 12;
 
-    while connection_attempts < max_connection_attempts {
+    while connection_attempts < MAX_CONNECTION_ATTEMPTS {
         sleep(Duration::from_secs(delay)).await;
         if delay == 0 {
             delay += 1;

@@ -4,6 +4,7 @@ use futures::{SinkExt, StreamExt};
 use lapin::Channel;
 use lapin::{options::*, types::FieldTable, Connection, ConnectionProperties};
 use message_parser::{parse_message, MessageResponse};
+use reqwest::header::CONTENT_TYPE;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -106,11 +107,10 @@ async fn start_ws(
     tx.send(Some("CAP REQ :twitch.tv/tags twitch.tv/commands".into()))
         .await
         .unwrap();
-    tx.send(Some(
-        format!("PASS {}", dotenv::var("TWITCH_OAUTH_TOKEN").unwrap()).into(),
-    ))
-    .await
-    .unwrap();
+    let access_token = get_twitch_access_token().await.unwrap();
+    tx.send(Some(format!("PASS oauth:{}", access_token).into()))
+        .await
+        .unwrap();
     tx.send(Some(
         format!("NICK {}", dotenv::var("TWITCH_BOT_NICK").unwrap()).into(),
     ))
@@ -183,11 +183,42 @@ async fn start_ws(
                     }
                 }
             }
-            Err(e) => panic!("[ERROR] Websocket Error: {:?}", e),
         }
     }
 
     return ws_rx;
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct TwitchTokenResponse {
+    access_token: String,
+}
+
+async fn get_twitch_access_token() -> Result<String, Box<dyn std::error::Error>> {
+    let params = [
+        ("grant_type", "refresh_token"),
+        ("client_id", &dotenv::var("TWITCH_CLIENT_ID").unwrap()),
+        (
+            "client_secret",
+            &dotenv::var("TWITCH_CLIENT_SECRET").unwrap(),
+        ),
+        (
+            "refresh_token",
+            &dotenv::var("TWITCH_REFRESH_TOKEN").unwrap(),
+        ),
+    ];
+    let client = reqwest::Client::new();
+    let res = client
+        .post("https://id.twitch.tv/oauth2/token")
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .form(&params)
+        .send()
+        .await?
+        .json::<TwitchTokenResponse>()
+        .await?;
+
+    return Ok(res.access_token);
 }
 
 async fn handle_skip(
@@ -214,7 +245,7 @@ async fn handle_skip(
                     if s.is_success() {
                         let _ = tx
                             .send(
-                                format!("PRIVMSG {} :Vote skip passed", channel_name.clone(),)
+                                format!("PRIVMSG {} :Vote skip passed", channel_name.clone())
                                     .into(),
                             )
                             .await

@@ -183,6 +183,10 @@ async fn start_ws(
                     }
                 }
             }
+            Err(e) => {
+                eprintln!("[ERROR] Websocket Error: {:?}", e);
+                return ws_rx;
+            }
         }
     }
 

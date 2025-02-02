@@ -140,7 +140,6 @@ async fn start_ws(
                     let message_str = message.to_string();
                     let messages: Vec<&str> = message_str.trim_end().split("\r\n").collect();
                     for m in messages.iter() {
-                        println!("[INFO] Message: {}", m);
                         let parsed_message = parse_message(m);
                         let response = generate_response(parsed_message).await;
                         match response {
@@ -148,6 +147,7 @@ async fn start_ws(
                                 if let Some(r) = gr {
                                     match r.event {
                                         ResponseEvent::Message => {
+                                            println!("[INFO] Message: {}", m);
                                             let response_message = r.message.unwrap();
                                             let _ = tx
                                                 .send(response_message.into())

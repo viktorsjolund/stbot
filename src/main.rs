@@ -29,14 +29,14 @@ async fn main() {
     let channel = amqp_conn.create_channel().await.unwrap();
 
     let mut connection_attempts = 0;
-    let mut delay = 0;
+    let mut reconnect_delay = 0;
 
     while connection_attempts < MAX_CONNECTION_ATTEMPTS {
-        sleep(Duration::from_secs(delay)).await;
-        if delay == 0 {
-            delay += 1;
+        sleep(Duration::from_secs(reconnect_delay)).await;
+        if reconnect_delay == 0 {
+            reconnect_delay = 1;
         } else {
-            delay *= 2;
+            reconnect_delay *= 2;
         }
 
         println!("[INFO] Connecting... (Attempt #{})", connection_attempts);
@@ -46,12 +46,12 @@ async fn main() {
             connection_attempts += 1;
             continue;
         }
+        println!("[INFO] Connected");
 
         connection_attempts = 0;
-        delay = 0;
+        reconnect_delay = 0;
 
-        println!("[INFO] Connected");
-        let (tx, rx) = mpsc::channel::<Option<String>>(100);
+        let (tx, rx) = mpsc::channel::<ReaderAction>(100);
         let (ws_stream, _) = ws_connection_result.unwrap();
         let (ws_tx, ws_rx) = ws_stream.split();
         let consumer_th = tokio::spawn(start_consumer(channel.clone(), tx.clone()));
@@ -66,24 +66,38 @@ async fn main() {
     }
 }
 
+enum ReaderActionEvent {
+    Message,
+    Close,
+}
+
+struct ReaderAction {
+    event: ReaderActionEvent,
+    message: Option<String>,
+}
+
 async fn start_reader(
-    mut rx: Receiver<Option<String>>,
+    mut rx: Receiver<ReaderAction>,
     mut ws_tx: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
 ) -> SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message> {
-    while let Some(m) = rx.recv().await {
-        match m {
-            Some(message) => {
-                println!("[INFO] Response: {}", message);
-                ws_tx.send(message.into()).await.unwrap()
+    while let Some(reader_act) = rx.recv().await {
+        match reader_act.event {
+            ReaderActionEvent::Message => {
+                let msg = reader_act.message.unwrap();
+                println!("[INFO] Response: {}", msg);
+                ws_tx.send(msg.into()).await.unwrap();
             }
-            None => return ws_tx,
+            ReaderActionEvent::Close => {
+                println!("[INFO] Closing reader");
+                return ws_tx;
+            }
         }
     }
 
     return ws_tx;
 }
 
-async fn start_consumer(channel: Channel, tx: Sender<Option<String>>) {
+async fn start_consumer(channel: Channel, tx: Sender<ReaderAction>) {
     let mut consumer = channel
         .basic_consume(
             "send",
@@ -96,39 +110,59 @@ async fn start_consumer(channel: Channel, tx: Sender<Option<String>>) {
     while let Some(delivery) = consumer.next().await {
         let delivery = delivery.expect("[ERROR] Error in consumer");
         let data = str::from_utf8(&delivery.data).unwrap();
-        tx.send(Some(data.into())).await.unwrap();
+        tx.send(ReaderAction {
+            event: ReaderActionEvent::Message,
+            message: Some(data.into()),
+        })
+        .await
+        .unwrap();
         delivery.ack(BasicAckOptions::default()).await.unwrap();
     }
 }
 
 async fn start_ws(
-    tx: Sender<Option<String>>,
+    tx: Sender<ReaderAction>,
     mut ws_rx: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
 ) -> SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-    tx.send(Some("CAP REQ :twitch.tv/tags twitch.tv/commands".into()))
-        .await
-        .unwrap();
+    tx.send(ReaderAction {
+        event: ReaderActionEvent::Message,
+        message: Some("CAP REQ :twitch.tv/tags twitch.tv/commands".into()),
+    })
+    .await
+    .unwrap();
     let access_token = get_twitch_access_token().await.unwrap();
-    tx.send(Some(format!("PASS oauth:{}", access_token).into()))
-        .await
-        .unwrap();
-    tx.send(Some(
-        format!("NICK {}", dotenv::var("TWITCH_BOT_NICK").unwrap()).into(),
-    ))
+    tx.send(ReaderAction {
+        event: ReaderActionEvent::Message,
+        message: Some(format!("PASS oauth:{}", access_token).into()),
+    })
+    .await
+    .unwrap();
+    tx.send(ReaderAction {
+        event: ReaderActionEvent::Message,
+        message: Some(format!("NICK {}", dotenv::var("TWITCH_BOT_NICK").unwrap()).into()),
+    })
     .await
     .unwrap();
     let twitch_ch_name = dotenv::var("TWITCH_CHANNEL_NAME");
     if let Ok(ch) = twitch_ch_name {
-        tx.send(Some(format!("JOIN #{}", ch).into())).await.unwrap();
+        tx.send(ReaderAction {
+            event: ReaderActionEvent::Message,
+            message: Some(format!("JOIN #{}", ch).into()),
+        })
+        .await
+        .unwrap();
     }
     let mut active_users = get_active_users().await.unwrap().users;
     for username in active_users.iter_mut() {
         *username = format!("#{}", username)
     }
     if active_users.len() > 0 {
-        tx.send(Some(format!("JOIN {}", active_users.join(",")).into()))
-            .await
-            .unwrap();
+        tx.send(ReaderAction {
+            event: ReaderActionEvent::Message,
+            message: Some(format!("JOIN {}", active_users.join(",")).into()),
+        })
+        .await
+        .unwrap();
     }
     let mut skip_channels = HashMap::<String, Arc<Mutex<Vec<String>>>>::new();
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
@@ -150,15 +184,22 @@ async fn start_ws(
                                         ResponseEvent::Message => {
                                             println!("[INFO] Message: {}", m);
                                             let response_message = r.message.unwrap();
-                                            let _ = tx
-                                                .send(response_message.into())
-                                                .await
-                                                .unwrap_or_else(|e| {
-                                                    eprintln!("[ERROR] Sender Error: {:?}", e)
-                                                });
+                                            tx.send(ReaderAction {
+                                                event: ReaderActionEvent::Message,
+                                                message: response_message.into(),
+                                            })
+                                            .await
+                                            .unwrap_or_else(|e| {
+                                                eprintln!("[ERROR] Sender Error: {:?}", e)
+                                            });
                                         }
                                         ResponseEvent::Reconnect => {
-                                            tx.send(None).await.unwrap();
+                                            tx.send(ReaderAction {
+                                                event: ReaderActionEvent::Close,
+                                                message: None,
+                                            })
+                                            .await
+                                            .unwrap();
                                             return ws_rx;
                                         }
                                         ResponseEvent::Skip => {
@@ -168,9 +209,9 @@ async fn start_ws(
                                             {
                                                 handle_skip(
                                                     &mut skip_channels,
-                                                    r,
                                                     &mut handles,
                                                     &mut last_skip,
+                                                    r,
                                                     &tx,
                                                 )
                                                 .await;
@@ -186,6 +227,12 @@ async fn start_ws(
             }
             Err(e) => {
                 eprintln!("[ERROR] Websocket Error: {:?}", e);
+                tx.send(ReaderAction {
+                    event: ReaderActionEvent::Close,
+                    message: None,
+                })
+                .await
+                .unwrap();
                 return ws_rx;
             }
         }
@@ -228,10 +275,10 @@ async fn get_twitch_access_token() -> Result<String, Box<dyn std::error::Error>>
 
 async fn handle_skip(
     skip_channels: &mut HashMap<String, Arc<Mutex<Vec<String>>>>,
-    gr: GeneratedResponse,
     handles: &mut Vec<JoinHandle<()>>,
     last_skip: &mut SystemTime,
-    tx: &Sender<Option<String>>,
+    gr: GeneratedResponse,
+    tx: &Sender<ReaderAction>,
 ) {
     let channel_name = gr.channel_name.unwrap();
     if let None = skip_channels.get(&channel_name) {
@@ -248,13 +295,15 @@ async fn handle_skip(
             match res {
                 Ok(s) => {
                     if s.is_success() {
-                        let _ = tx
-                            .send(
-                                format!("PRIVMSG {} :Vote skip passed", channel_name.clone())
-                                    .into(),
-                            )
-                            .await
-                            .unwrap_or_else(|e| eprintln!("[ERROR] Sender Error: {:?}", e));
+                        tx.send(ReaderAction {
+                            event: ReaderActionEvent::Message,
+                            message: Some(format!(
+                                "PRIVMSG {} :Vote skip passed",
+                                channel_name.clone()
+                            )),
+                        })
+                        .await
+                        .unwrap_or_else(|e| eprintln!("[ERROR] Sender Error: {:?}", e));
                         *last_skip = SystemTime::now();
                         for h in handles {
                             h.abort();

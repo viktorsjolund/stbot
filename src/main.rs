@@ -62,7 +62,9 @@ async fn main() {
         consumer_th.abort();
 
         println!("[INFO] Closing websocket connection...");
-        ws_tx.reunite(ws_rx).unwrap().close(None).await.unwrap();
+        if let Err(e) = ws_tx.reunite(ws_rx).unwrap().close(None).await {
+            println!("[ERROR] Could not close websocket connection: {:?}", e)
+        }
     }
 }
 

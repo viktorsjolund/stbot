@@ -40,7 +40,7 @@ async fn main() {
         }
 
         println!("[INFO] Connecting... (Attempt #{})", connection_attempts);
-        let ws_connection_result = connect_async("ws://irc-ws.chat.twitch.tv:80").await;
+        let ws_connection_result = connect_async("wss://irc-ws.chat.twitch.tv:443").await;
         if let Err(e) = ws_connection_result {
             eprintln!("[ERROR] Connection failed: {:?}", e);
             connection_attempts += 1;
